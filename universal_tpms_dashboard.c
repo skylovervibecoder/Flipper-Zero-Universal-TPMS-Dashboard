@@ -49,13 +49,17 @@
  *              OK sends the selected wheel; hold OK to send all wheels
  *              RESET + OK applies 230 kPa front / 210 kPa rear and sends all
  *   Pair       (Nissan/Renault native, or any protocol; AUTO scans 315/433 FSK/OOK/GFSK)
- *              Up/Down selects a sensor, Left/Right assigns a wheel
- *              (FL, FR, RL, RR, --); OK saves when all four are assigned
+ *              Each new sensor is tentatively assigned in order FR, FL, RL, RR.
+ *              Up/Down selects a sensor, Left/Right changes its wheel
+ *              (--, FL, FR, RL, RR); the other sensors are left untouched, so
+ *              duplicates are allowed while editing. OK saves: it needs all four
+ *              wheels covered and gives an error if a wheel is used twice.
  *              Hold OK to clear the list; Back returns to menu
  *   Settings   Up/Down selects an item, OK opens/runs it, Back returns to menu
  *              Proto / Radio rows: Left/Right (or OK) change protocol / radio profile
  *              (changing protocol resets IDs: re-pair or type them again)
  *              Save / Save as / Load vehicle (Left deletes a selected vehicle)
+ *              Delete vehicle: pick a saved vehicle, OK twice to confirm
  *              ID editor: Left/Right selects a digit, Up/Down changes it
  */
 
@@ -127,14 +131,15 @@
 #define SYNC_INVERTED 0xAA9UL /* stessa cosa a polarita' invertita */
 
 #define MENU_ITEMS  5U
-#define SET_ROWS    10U /* 4 ID + Protocollo + Radio + Salva + Salva con nome + Carica + Predefiniti */
+#define SET_ROWS    11U /* 4 ID + Protocollo + Radio + Salva + Salva con nome + Carica + Elimina + Predefiniti */
 #define SET_VISIBLE 5U
 #define SET_PROTO   4U
 #define SET_RADIO   5U
 #define SET_SAVE    6U
 #define SET_SAVEAS  7U
 #define SET_LOAD    8U
-#define SET_DEFAULT 9U
+#define SET_DELETE  9U
+#define SET_DEFAULT 10U
 
 /* ------------------------------------------------------------------------ */
 /* Sensori, in ordine: ANT SX, ANT DX, POST SX, POST DX.                      */
@@ -458,6 +463,7 @@ typedef struct {
     uint8_t cars_sel;
     uint8_t cars_scroll;
     bool cars_del; /* in attesa di conferma eliminazione */
+    bool cars_delete_mode; /* true = lista aperta da "Delete vehicle" (OK elimina), false = "Load vehicle" */
     char cars_msg[16];
 
     /* Editor nome auto */
@@ -896,6 +902,13 @@ static void active_save(void) {
     furi_record_close(RECORD_STORAGE);
 }
 
+/* config.txt: dimentica l'auto attiva (usata quando la si elimina). */
+static void active_clear(void) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_simply_remove(st, CONFIG_PATH);
+    furi_record_close(RECORD_STORAGE);
+}
+
 /* Primo avvio dopo la rinomina: copia auto e config dalla vecchia cartella
  * apps_data/nissan_dashboard (i file originali non vengono toccati). */
 static void legacy_migrate(void) {
@@ -1075,6 +1088,48 @@ static void list_fix_scroll(uint8_t sel, uint8_t* scroll, uint8_t visible) {
     if(sel >= *scroll + visible) *scroll = (uint8_t)(sel - visible + 1U);
 }
 
+/* Quanti sensori in lista sono assegnati a questa ruota. */
+static uint8_t pair_wheel_count(const App* app, uint8_t wheel) {
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < app->pair_n; i++) {
+        if(app->pair[i].wheel == wheel) n++;
+    }
+    return n;
+}
+
+/* Quante ruote diverse (0..4) hanno almeno un sensore assegnato. */
+static uint8_t pair_assigned(const App* app) {
+    uint8_t n = 0;
+    for(uint8_t w = 0; w < N_WHEELS; w++) {
+        if(pair_wheel_count(app, w) > 0U) n++;
+    }
+    return n;
+}
+
+/* Prima ruota assegnata a piu' di un sensore (NO_WHEEL = nessun doppione). */
+static uint8_t pair_first_duplicate(const App* app) {
+    for(uint8_t w = 0; w < N_WHEELS; w++) {
+        if(pair_wheel_count(app, w) > 1U) return w;
+    }
+    return NO_WHEEL;
+}
+
+/* Ordine dell'assegnazione automatica: FR, FL, RL, RR (indici di k_names). */
+static const uint8_t k_pair_auto_order[N_WHEELS] = {1U, 0U, 2U, 3U};
+
+/* Un sensore appena sentito prende la prima ruota libera nell'ordine FR, FL, RL, RR.
+ * E' solo provvisorio: si puo' cambiare a mano. Se le 4 ruote sono gia' prese
+ * resta non assegnato. */
+static void pair_auto_assign(App* app, PairSensor* p) {
+    for(uint8_t k = 0; k < N_WHEELS; k++) {
+        uint8_t w = k_pair_auto_order[k];
+        if(pair_wheel_count(app, w) == 0U) {
+            p->wheel = w;
+            return;
+        }
+    }
+}
+
 /* Frame ricevuto in PAIR: ogni ID nuovo finisce in lista, poi si aggiorna. */
 static bool pair_handle_frame(App* app, const uint8_t* f) {
     if(crc8_07(f, 8U) != f[8]) {
@@ -1095,6 +1150,7 @@ static bool pair_handle_frame(App* app, const uint8_t* f) {
         memset(p, 0, sizeof(PairSensor));
         memcpy(p->id, f + 3, 3);
         p->wheel = NO_WHEEL;
+        pair_auto_assign(app, p);
     }
 
     uint16_t raw = (uint16_t)((((uint16_t)f[0] & 3U) << 8) | f[1]);
@@ -1106,28 +1162,15 @@ static bool pair_handle_frame(App* app, const uint8_t* f) {
     return true;
 }
 
-static uint8_t pair_assigned(const App* app) {
-    uint8_t n = 0;
-    for(uint8_t i = 0; i < app->pair_n; i++) {
-        if(app->pair[i].wheel != NO_WHEEL) n++;
-    }
-    return n;
-}
-
 /* Cambia la ruota assegnata al sensore selezionato: -- > ANT SX > ANT DX >
- * POST SX > POST DX > --. Una ruota ha un solo sensore: se era gia' di un
- * altro sensore, quello torna non assegnato. */
+ * POST SX > POST DX > --. Gli altri sensori non vengono toccati: i doppioni
+ * sono ammessi finche' si modifica, il controllo avviene al salvataggio. */
 static void pair_cycle_wheel(App* app, int dir) {
     PairSensor* p = &app->pair[app->pair_sel];
     int cur = (p->wheel == NO_WHEEL) ? -1 : (int)p->wheel;
     cur += dir;
     if(cur > (int)N_WHEELS - 1) cur = -1;
     if(cur < -1) cur = (int)N_WHEELS - 1;
-    if(cur >= 0) {
-        for(uint8_t i = 0; i < app->pair_n; i++) {
-            if(app->pair[i].wheel == (uint8_t)cur) app->pair[i].wheel = NO_WHEEL;
-        }
-    }
     p->wheel = (cur < 0) ? NO_WHEEL : (uint8_t)cur;
 }
 
@@ -1295,6 +1338,7 @@ static bool pair_handle_generic(App* app, const UtdFrame* fr) {
         memset(p, 0, sizeof(PairSensor));
         memcpy(p->id, idb, ID_MAX);
         p->wheel = NO_WHEEL;
+        pair_auto_assign(app, p);
     }
     p->kind = (uint8_t)fr->kind;
     p->profile = app->rx_profile;
@@ -1796,7 +1840,7 @@ static void draw_about(Canvas* canvas) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignCenter, "Universal TPMS");
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter, "Dashboard 2.0beta");
+    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter, "Dashboard 0.3.0beta");
     canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "created by Marcopiiit");
     canvas_draw_str_aligned(canvas, 64, 52, AlignCenter, AlignCenter, "codecs: TPMS-Editor-EN");
 }
@@ -2004,6 +2048,8 @@ static void draw_settings(Canvas* canvas, const App* app) {
                 label = "Save as...";
             } else if(r == SET_LOAD) {
                 label = "Load vehicle";
+            } else if(r == SET_DELETE) {
+                label = "Delete vehicle";
             }
             canvas_draw_str_aligned(canvas, 5, y0 + 5, AlignLeft, AlignCenter, label);
         }
@@ -2115,13 +2161,13 @@ static void draw_pair(Canvas* canvas, const App* app) {
         canvas_draw_str_aligned(canvas, 5, y0 + 5, AlignLeft, AlignCenter, buf);
         snprintf(buf, sizeof(buf), "%ukPa", (unsigned)p->kpa);
         canvas_draw_str_aligned(canvas, 96, y0 + 5, AlignRight, AlignCenter, buf);
-        canvas_draw_str_aligned(
-            canvas,
-            119,
-            y0 + 5,
-            AlignRight,
-            AlignCenter,
-            (p->wheel < N_WHEELS) ? k_short[p->wheel] : "--");
+        if(p->wheel < N_WHEELS) {
+            bool dup = pair_wheel_count(app, p->wheel) > 1U;
+            snprintf(buf, sizeof(buf), "%s%s", k_short[p->wheel], dup ? "!" : "");
+        } else {
+            snprintf(buf, sizeof(buf), "--");
+        }
+        canvas_draw_str_aligned(canvas, 119, y0 + 5, AlignRight, AlignCenter, buf);
         canvas_set_color(canvas, ColorBlack);
     }
 
@@ -2146,10 +2192,17 @@ static void draw_pair(Canvas* canvas, const App* app) {
 
 static void draw_cars(Canvas* canvas, const App* app) {
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 10, "Load vehicle");
+    canvas_draw_str(canvas, 2, 10, app->cars_delete_mode ? "Delete car" : "Load vehicle");
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(
-        canvas, 126, 5, AlignRight, AlignCenter, app->cars_msg[0] ? app->cars_msg : "Left: delete");
+        canvas,
+        126,
+        5,
+        AlignRight,
+        AlignCenter,
+        app->cars_msg[0]        ? app->cars_msg :
+        app->cars_delete_mode ? "OK: delete" :
+                                  "Left: delete");
     canvas_draw_line(canvas, 0, 12, 127, 12);
 
     if(app->cars_n == 0U) {
@@ -2521,8 +2574,9 @@ static bool on_input_settings(App* app, const InputEvent* ev) {
             }
         } else if(app->set_sel == SET_SAVEAS) {
             name_init(app, 0);
-        } else if(app->set_sel == SET_LOAD) {
+        } else if(app->set_sel == SET_LOAD || app->set_sel == SET_DELETE) {
             cars_scan(app);
+            app->cars_delete_mode = (app->set_sel == SET_DELETE);
             app->cars_sel = 0;
             for(uint8_t i = 0; i < app->cars_n; i++) {
                 if(strcmp(app->cars[i], g_car_name) == 0) app->cars_sel = i;
@@ -2627,7 +2681,10 @@ static bool on_input_pair(App* app, const InputEvent* ev) {
     case InputKeyOk: {
         if(ev->type != InputTypeShort) return false;
         uint8_t n = pair_assigned(app);
-        if(n < N_WHEELS) {
+        uint8_t dup = pair_first_duplicate(app);
+        if(dup != NO_WHEEL) {
+            snprintf(app->pair_msg, sizeof(app->pair_msg), "Duplicate wheel %s!", k_names[dup]);
+        } else if(n < N_WHEELS) {
             snprintf(app->pair_msg, sizeof(app->pair_msg), "Assign 4 wheels (%u/4)", (unsigned)n);
         } else if(!pair_kinds_uniform(app)) {
             snprintf(app->pair_msg, sizeof(app->pair_msg), "Mixed protocols!");
@@ -2667,17 +2724,23 @@ static bool on_input_cars(App* app, const InputEvent* ev) {
         app->cars_msg[0] = 0;
         return true;
     case InputKeyLeft:
-        if(ev->type != InputTypeShort || app->cars_n == 0U) return false;
+        if(ev->type != InputTypeShort || app->cars_n == 0U || app->cars_delete_mode) return false;
         app->cars_del = true; /* serve una conferma con OK */
         snprintf(app->cars_msg, sizeof(app->cars_msg), "OK: delete?");
         return true;
     case InputKeyOk:
         if(ev->type != InputTypeShort || app->cars_n == 0U) return false;
-        if(app->cars_del) {
+        if(app->cars_delete_mode && !app->cars_del) {
+            app->cars_del = true; /* primo OK: chiede conferma */
+            snprintf(app->cars_msg, sizeof(app->cars_msg), "Sure? OK");
+        } else if(app->cars_del) {
             char name[CAR_NAME_LEN + 1];
             snprintf(name, sizeof(name), "%s", app->cars[app->cars_sel]);
             car_delete(name);
-            if(strcmp(name, g_car_name) == 0) g_car_name[0] = 0;
+            if(strcmp(name, g_car_name) == 0) {
+                g_car_name[0] = 0;
+                active_clear(); /* all'avvio non deve ricaricare l'auto eliminata */
+            }
             cars_scan(app);
             if(app->cars_sel >= app->cars_n) app->cars_sel = app->cars_n ? (uint8_t)(app->cars_n - 1U) : 0U;
             app->cars_scroll = 0;
