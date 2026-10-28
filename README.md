@@ -8,6 +8,11 @@ A Flipper Zero Momentum app for monitoring, pairing, configuring, and transmitti
 >
 > Use for research and authorized testing only. Do not rely on this application for vehicle safety or roadworthiness decisions.
 
+This app is a porting of the existing Nissan TPMS Dashboard to the sensors present in TPMS-Editor
+
+https://github.com/skylovervibecoder/Flipper-Zero-Nissan-TPMS-Dashboard
+
+
 ## Features
 
 - **Monitor:** Receive supported TPMS transmissions and display sensor pressure and temperature.
