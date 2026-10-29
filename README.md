@@ -12,6 +12,11 @@ This app is a porting of the existing Nissan TPMS Dashboard to the sensors prese
 
 https://github.com/skylovervibecoder/Flipper-Zero-Nissan-TPMS-Dashboard
 
+![rx](rx.png)
+
+------------
+
+![tx](tx.png)
 
 ## Features
 
